@@ -355,7 +355,7 @@ function Kong.init()
     error("error building initial plugins map: ", err)
   end
 
-  assert(runloop.build_router(db, "init"))
+  runloop.init.after()
 
   db:close()
 end
