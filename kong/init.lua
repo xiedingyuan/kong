@@ -70,7 +70,6 @@ local openssl_pkey = require "openssl.pkey"
 local openssl_x509 = require "openssl.x509"
 local runloop = require "kong.runloop.handler"
 local mesh = require "kong.runloop.mesh"
-local semaphore = require "ngx.semaphore"
 local singletons = require "kong.singletons"
 local kong_cache = require "kong.cache"
 local ngx_balancer = require "ngx.balancer"
@@ -110,83 +109,10 @@ local TLS_SCHEMES = {
   tls = true,
 }
 
-local PLUGINS_MAP_CACHE_OPTS = { ttl = 0 }
-
-local plugins_map_semaphore
-local plugins_map_version
 local configured_plugins
 local loaded_plugins
 local schema_state
 
-local function build_plugins_map(db, version)
-  local map = {}
-
-  for plugin, err in db.plugins:each(1000) do
-    if err then
-      return nil, err
-    end
-
-    map[plugin.name] = true
-  end
-
-  if version then
-    plugins_map_version = version
-  end
-
-  configured_plugins = map
-
-  return true
-end
-
-local function plugins_map_wrapper()
-  local version, err = kong.cache:get("plugins_map:version",
-                                      PLUGINS_MAP_CACHE_OPTS, utils.uuid)
-  if err then
-    return nil, "failed to retrieve plugins map version: " .. err
-  end
-
-  if plugins_map_version ~= version then
-    local timeout = 60
-    if singletons.configuration.database == "cassandra" then
-      -- cassandra_timeout is defined in ms
-      timeout = singletons.configuration.cassandra_timeout / 1000
-
-    elseif singletons.configuration.database == "postgres" then
-      -- pg_timeout is defined in ms
-      timeout = singletons.configuration.pg_timeout / 1000
-    end
-
-    -- try to acquire the mutex (semaphore)
-    local ok, err = plugins_map_semaphore:wait(timeout)
-    if not ok then
-      return nil, "failed to acquire plugins map rebuild mutex: " .. err
-    end
-
-    -- we have the lock but we might not have needed it. check the
-    -- version again and rebuild if necessary
-    version, err = kong.cache:get("plugins_map:version",
-                                  PLUGINS_MAP_CACHE_OPTS, utils.uuid)
-    if err then
-      plugins_map_semaphore:post(1)
-      return nil, "failed to re-retrieve plugins map version: " .. err
-    end
-
-    if plugins_map_version ~= version then
-      -- we have the lock and we need to rebuild the map
-      ngx_log(ngx_DEBUG, "rebuilding plugins map")
-
-      local ok, err = build_plugins_map(kong.db, version)
-      if not ok then
-        plugins_map_semaphore:post(1)
-        return nil, "failed to rebuild plugins map: " .. err
-      end
-    end
-
-    plugins_map_semaphore:post(1)
-  end
-
-  return true
-end
 
 -- Kong public context handlers.
 -- @section kong_handlers
@@ -343,17 +269,6 @@ function Kong.init()
   -- Load plugins as late as possible so that everything is set up
   loaded_plugins = assert(db.plugins:load_plugin_schemas(config.loaded_plugins))
   sort_plugins_for_execution(config, db, loaded_plugins)
-
-  local err
-  plugins_map_semaphore, err = semaphore.new(1) -- 1 = treat this as a mutex
-  if not plugins_map_semaphore then
-    error("failed to create plugins map semaphore: " .. err)
-  end
-
-  local _, err = build_plugins_map(db, "init")
-  if err then
-    error("error building initial plugins map: ", err)
-  end
 
   runloop.init.after()
 
@@ -514,12 +429,7 @@ function Kong.ssl_certificate()
 
   runloop.certificate.before(ctx)
 
-  local ok, err = plugins_map_wrapper()
-  if not ok then
-    ngx_log(ngx_CRIT, "could not ensure plugins map is up to date: ", err)
-    return ngx.exit(ngx.ERROR)
-  end
-
+  configured_plugins = runloop.get_plugins_map()
   for plugin, plugin_conf in plugins_iterator(ctx, loaded_plugins,
                                               configured_plugins, true) do
     kong_global.set_namespaced_log(kong, plugin.name)
@@ -633,15 +543,10 @@ function Kong.rewrite()
 
   runloop.rewrite.before(ctx)
 
-  local ok, err = plugins_map_wrapper()
-  if not ok then
-    ngx_log(ngx_CRIT, "could not ensure plugins map is up to date: ", err)
-    return kong.response.exit(500, { message  = "An unexpected error occurred" })
-  end
-
   -- we're just using the iterator, as in this rewrite phase no consumer nor
   -- route will have been identified, hence we'll just be executing the global
   -- plugins
+  configured_plugins = runloop.get_plugins_map()
   for plugin, plugin_conf in plugins_iterator(ctx, loaded_plugins,
                                               configured_plugins, true) do
     kong_global.set_named_ctx(kong, "plugin", plugin_conf)
@@ -662,12 +567,7 @@ function Kong.preread()
 
   runloop.preread.before(ctx)
 
-  local ok, err = plugins_map_wrapper()
-  if not ok then
-    ngx_log(ngx_CRIT, "could not ensure plugins map is up to date: ", err)
-    return ngx.exit(ngx.ERROR)
-  end
-
+  configured_plugins = runloop.get_plugins_map()
   for plugin, plugin_conf in plugins_iterator(ctx, loaded_plugins,
                                               configured_plugins, true) do
     kong_global.set_named_ctx(kong, "plugin", plugin_conf)
@@ -781,6 +681,7 @@ function Kong.handle_error()
   ctx.KONG_UNEXPECTED = true
 
   if not ctx.plugins_for_request then
+    configured_plugins = runloop.get_plugins_map()
     for _ in plugins_iterator(ctx, loaded_plugins, configured_plugins, true) do
       -- just build list of plugins
     end

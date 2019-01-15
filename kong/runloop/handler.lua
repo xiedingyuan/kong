@@ -43,7 +43,7 @@ local DEBUG       = ngx.DEBUG
 local NOTICE      = ngx.NOTICE
 
 
-local CACHE_ROUTER_OPTS = { ttl = 0 }
+local CACHE_OPTS = { ttl = 0 }
 local EMPTY_T = {}
 
 
@@ -53,6 +53,14 @@ local build_router
 local rebuild_router
 local build_router_semaphore
 local _set_rebuild_router
+
+
+local init_plugins_map
+local get_plugins_map
+local build_plugins_map
+local rebuild_plugins_map
+local build_plugins_map_semaphore
+local _set_rebuild_plugins_map
 
 
 local server_header = meta._SERVER_TOKENS
@@ -84,7 +92,7 @@ do
       end
 
       local cache_key = kong.db.services:cache_key(service.id)
-      service, err = kong.cache:get(cache_key, CACHE_ROUTER_OPTS, function()
+      service, err = kong.cache:get(cache_key, CACHE_OPTS, function()
         return service
       end)
       if err then
@@ -104,7 +112,7 @@ do
     local service, err
     if kong.cache then
       local cache_key = kong.db.services:cache_key(service_pk.id)
-      service, err = kong.cache:get(cache_key, CACHE_ROUTER_OPTS,
+      service, err = kong.cache:get(cache_key, CACHE_OPTS,
                                     load_service_db, service_pk)
 
     else
@@ -116,6 +124,9 @@ do
 
   local router
   local router_version
+
+  local plugins_map
+  local plugins_map_version
 
   local function lock_router(wait)
     local ok, err = build_router_semaphore:wait(wait or 0)
@@ -132,8 +143,27 @@ do
     return true
   end
 
+  local function lock_plugins_map(wait)
+    local ok, err = build_plugins_map_semaphore:wait(wait or 0)
+    if not ok then
+      if err ~= "timeout" then
+        log(ERR, "error attempting to acquire plugins map lock: " .. err)
+      elseif wait and wait > 0 then
+        log(NOTICE, "timeout attempting to acquire plugins map lock")
+      end
+
+      return false
+    end
+
+    return true
+  end
+
   local function unlock_router()
     build_router_semaphore:post()
+  end
+
+  local function unlock_plugins_map()
+    build_plugins_map_semaphore:post()
   end
 
   local function get_router_version()
@@ -141,9 +171,23 @@ do
       return "init"
     end
 
-    local version, err = kong.cache:get("router:version", CACHE_ROUTER_OPTS, utils.uuid)
+    local version, err = kong.cache:get("router:version", CACHE_OPTS, utils.uuid)
     if err then
       log(CRIT, "could not ensure router is up to date: ", err)
+      return nil
+    end
+
+    return version
+  end
+
+  local function get_plugins_map_version()
+    if not kong.cache then
+      return "init"
+    end
+
+    local version, err = kong.cache:get("plugins_map:version", CACHE_OPTS, utils.uuid)
+    if err then
+      log(CRIT, "could not ensure plugins map is up to date: ", err)
       return nil
     end
 
@@ -177,6 +221,33 @@ do
       get_router = function()
         rebuild_router(timeout)
         return router
+      end
+    end
+  end
+
+  init_plugins_map = function()
+    local err
+    build_plugins_map_semaphore, err = semaphore.new(1)
+    if err then
+      log(CRIT, "failed to create build plugins map semaphore: ", err)
+    end
+
+    local timeout = kong.configuration.plugins_map_timeout
+    if timeout then
+      timeout = timeout / 1000
+    else
+      timeout = 5
+    end
+
+    if timeout < 0 then
+      get_plugins_map = function()
+        return plugins_map
+      end
+
+    else
+      get_plugins_map = function()
+        rebuild_plugins_map(timeout)
+        return plugins_map
       end
     end
   end
@@ -308,6 +379,59 @@ do
     return true
   end
 
+  build_plugins_map = function(version, recurse, tries)
+    tries = tries or 1
+
+    local current_version
+    current_version = get_plugins_map_version()
+    if version ~= current_version then
+      return build_plugins_map(current_version)
+    end
+
+    local new_plugins_map, counter = {}, 0
+
+    for plugin, err in kong.db.plugins:each(1000) do
+      if err then
+        current_version = get_plugins_map_version()
+        if version ~= current_version then
+          return build_plugins_map(current_version)
+        end
+
+        if recurse and tries < 6 then
+          kong.db:setkeepalive()
+          log(NOTICE,  "could not load plugins: " .. err)
+          sleep(0.01 * tries * tries)
+          kong.db:connect()
+          return build_plugins_map(current_version, recurse, tries + 1)
+        end
+
+        return nil, "could not load plugins: " .. err
+      end
+
+      if recurse and counter % 1000 then
+        current_version = get_plugins_map_version()
+        if version ~= current_version then
+          return build_plugins_map(current_version)
+        end
+      end
+
+      new_plugins_map[plugin.name] = true
+      counter = counter + 1
+    end
+
+    plugins_map_version = version
+    plugins_map = new_plugins_map
+
+    if recurse then
+      current_version = get_plugins_map_version()
+      if version ~= current_version then
+        return build_plugins_map(current_version)
+      end
+    end
+
+    return true
+  end
+
   local function rebuild_router_timer(premature, version)
     if premature then
       unlock_router()
@@ -326,6 +450,24 @@ do
     kong.db:setkeepalive()
   end
 
+  local function rebuild_plugins_map_timer(premature, version)
+    if premature then
+      unlock_plugins_map()
+      return
+    end
+
+    kong.db:connect()
+
+    local pok, ok, err = pcall(build_plugins_map, version, true)
+    if not pok or not ok then
+      log(CRIT, "could not asynchronously rebuild plugins map: ", ok or err)
+    end
+
+    unlock_plugins_map()
+
+    kong.db:setkeepalive()
+  end
+
   local function rebuild_router_sync(version)
     kong.db:connect()
 
@@ -337,10 +479,31 @@ do
     kong.db:setkeepalive()
   end
 
+  local function rebuild_plugins_map_sync(version)
+    kong.db:connect()
+
+    local pok, ok, err = pcall(build_plugins_map, version)
+    if not pok or not ok then
+      log(CRIT, "could not synchronously rebuild plugins map: ", ok or err)
+    end
+
+    kong.db:setkeepalive()
+  end
+
   local function rebuild_router_async(version)
     local ok, err = ngx.timer.at(0, rebuild_router_timer, version)
     if not ok then
       log(CRIT, "could not create rebuild router timer: ", err)
+      return false
+    end
+
+    return true
+  end
+
+  local function rebuild_plugins_map_async(version)
+    local ok, err = ngx.timer.at(0, rebuild_plugins_map_timer, version)
+    if not ok then
+      log(CRIT, "could not create rebuild plugins map timer: ", err)
       return false
     end
 
@@ -383,9 +546,49 @@ do
     end
   end
 
+  rebuild_plugins_map = function(wait)
+    local version = get_plugins_map_version()
+    if version == plugins_map_version then
+      return
+    end
+
+    local ok = lock_plugins_map(wait)
+    if not ok then
+      if wait and wait > 0 then
+        rebuild_plugins_map_sync(version)
+      end
+
+      return
+    end
+
+    version = get_plugins_map_version()
+    if version == plugins_map_version then
+      unlock_plugins_map()
+      return
+    end
+
+    log(DEBUG, "rebuilding plugins map")
+
+    if wait and wait > 0 then
+      rebuild_plugins_map_sync(version)
+      unlock_plugins_map()
+
+    else
+      ok = rebuild_plugins_map_async(version)
+      if not ok and wait == 0 then
+        rebuild_plugins_map_sync(version)
+        unlock_plugins_map()
+      end
+    end
+  end
+
   -- for unit-testing purposes only
   _set_rebuild_router = function(f)
     rebuild_router = f
+  end
+
+  _set_rebuild_plugins_map = function(f)
+    rebuild_plugins_map = f
   end
 end
 
@@ -476,14 +679,18 @@ end
 -- in the table below the `before` and `after` is to indicate when they run:
 -- before or after the plugins
 return {
-  build_router     = build_router,
+  get_plugins_map = function()
+    return get_plugins_map()
+  end,
 
   -- exported for unit-testing purposes only
   _set_rebuild_router = _set_rebuild_router,
+  _set_rebuild_plugins_map = _set_rebuild_plugins_map,
 
   init = {
     after = function()
       build_router("init")
+      build_plugins_map("init")
     end
   },
 
@@ -735,6 +942,7 @@ return {
       end)
 
       init_router()
+      init_plugins_map()
 
       ngx.timer.every(1, function(premature)
         if premature then
@@ -742,11 +950,12 @@ return {
         end
 
         rebuild_router()
+        rebuild_plugins_map()
       end)
     end
   },
   certificate = {
-    before = function(_)
+    before = function(ctx)
       certificate.execute()
     end
   },

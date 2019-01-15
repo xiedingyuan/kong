@@ -157,6 +157,7 @@ local CONF_INFERENCES = {
   dns_no_sync = { typ = "boolean" },
 
   router_timeout = { typ = "number" },
+  plugins_map_timeout = { typ = "number" },
 
   client_ssl = { typ = "boolean" },
 
