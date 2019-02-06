@@ -477,6 +477,85 @@ local localhosts = {
 
 for _, strategy in helpers.each_strategy() do
 
+  describe("#mockresolver #" .. strategy, function()
+
+    setup(function()
+      assert(helpers.get_db_utils(strategy, {
+        "routes",
+        "services",
+        "plugins",
+        "upstreams",
+        "targets",
+      }))
+
+      helpers.start_kong({
+        database   = strategy,
+        nginx_conf = "spec/fixtures/custom_nginx.template",
+        db_update_frequency = 0.1,
+        lua_package_path = "spec/fixtures/mocks/lua-resty-dns/?.lua;" .. package.path,
+      })
+    end)
+
+    teardown(function()
+      helpers.stop_kong(nil, true, true)
+    end)
+
+    for mode, localhost in pairs(localhosts) do
+
+      it("perform passive health checks", function()
+
+        for nfails = 1, 3 do
+
+          -- configure healthchecks
+          local upstream_name = add_upstream({
+            healthchecks = healthchecks_config {
+              passive = {
+                unhealthy = {
+                  http_failures = nfails,
+                }
+              }
+            }
+          })
+          local port1 = add_target(upstream_name, localhost)
+          local port2 = add_target(upstream_name, localhost)
+          local api_host = add_api(upstream_name)
+
+          local requests = SLOTS * 2 -- go round the balancer twice
+
+          -- setup target servers:
+          -- server2 will only respond for part of the test,
+          -- then server1 will take over.
+          local server2_oks = math.floor(requests / 4)
+          local server1 = http_server(localhost, port1, {
+            requests - server2_oks - nfails
+          })
+          local server2 = http_server(localhost, port2, {
+            server2_oks,
+            nfails
+          })
+
+          -- Go hit them with our test requests
+          local client_oks, client_fails = client_requests(requests, api_host)
+
+          -- collect server results; hitcount
+          local _, ok1, fail1 = server1:done()
+          local _, ok2, fail2 = server2:done()
+
+          -- verify
+          assert.are.equal(requests - server2_oks - nfails, ok1)
+          assert.are.equal(server2_oks, ok2)
+          assert.are.equal(0, fail1)
+          assert.are.equal(nfails, fail2)
+
+          assert.are.equal(requests - nfails, client_oks)
+          assert.are.equal(nfails, client_fails)
+        end
+      end)
+
+    end
+
+  end)
+
   describe("Ring-balancer #" .. strategy, function()
 
     setup(function()
