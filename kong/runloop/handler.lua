@@ -561,22 +561,11 @@ return {
       -- local events (same worker)
 
 
-      local function router_rebuild_events()
-        local ok, err = worker_events.post("router", "rebuild")
-        if not ok then
-          log(ERR, "failed broadcasting router rebuild event to workers: ", err)
-        end
-
-        ok, err = cluster_events:broadcast("router", "rebuild")
-        if not ok then
-          log(ERR, "failed broadcasting router rebuild event to cluster: ", err)
-        end
-      end
-
       worker_events.register(function()
         log(DEBUG, "[events] Route updated, invalidating router")
-        router_rebuild_events()
+        cache:invalidate("router:version")
       end, "crud", "routes")
+
 
       worker_events.register(function(data)
         if data.operation ~= "create" and
@@ -587,23 +576,10 @@ return {
           -- ditto for deletion: if a Service if being deleted, it is
           -- only allowed because no Route is pointing to it anymore.
           log(DEBUG, "[events] Service updated, invalidating router")
-          router_rebuild_events()
+          cache:invalidate("router:version")
         end
       end, "crud", "services")
 
-      worker_events.register(function()
-        cache:invalidate_local("router:version")
-        rebuild_router()
-      end, "router", "rebuild")
-
-      cluster_events:subscribe("router", function(event)
-        if event == "rebuild" then
-          local ok, err = worker_events.post("router", "rebuild")
-          if not ok then
-            log(ERR, "failed broadcasting router rebuild event to workers: ", err)
-          end
-        end
-      end)
 
       worker_events.register(function(data)
         log(DEBUG, "[events] Plugin updated, invalidating plugins map")
@@ -759,6 +735,14 @@ return {
       end)
 
       init_router()
+
+      ngx.timer.every(1, function(premature)
+        if premature then
+          return
+        end
+
+        rebuild_router()
+      end)
     end
   },
   certificate = {
