@@ -146,6 +146,8 @@ local function get_page_size(args)
   end
 end
 
+local resolve_foreign
+
 
 local function query_entity(context, self, db, schema, method)
   local is_insert = context == "insert"
@@ -154,6 +156,7 @@ local function query_entity(context, self, db, schema, method)
   local args
   if is_update or is_insert then
     args = self.args.post
+    resolve_foreign(self, db, schema, args)
   else
     args = self.args.uri
   end
@@ -232,8 +235,33 @@ local function insert_entity(...)
   return query_entity("insert", ...)
 end
 
+
 local function page_collection(...)
   return query_entity("page", ...)
+end
+
+
+resolve_foreign = function(self, db, schema, args)
+  for foreign_field_name, foreign_field in schema:each_field() do
+    local foreign_schema = foreign_field.schema
+    if foreign_field.type == "foreign" and not foreign_schema.legacy then
+      local foreign_args = args[foreign_field_name]
+      if foreign_args then
+        local foreign_pk = foreign_schema:extract_pk_values(foreign_args)
+        local foreign_param = foreign_args[foreign_schema.endpoint_key]
+        if not foreign_schema:validate_primary_key(foreign_pk) and
+          foreign_param then
+          local previous = self.params[foreign_schema.name]
+          self.params[foreign_schema.name] = foreign_param
+          local foreign_entity, _, err_t = select_entity(self, db, foreign_schema)
+          if foreign_entity then
+            args[foreign_field_name] = foreign_schema:extract_pk_values(foreign_entity)
+          end
+          self.params[foreign_schema.name] = previous
+        end
+      end
+    end
+  end
 end
 
 
