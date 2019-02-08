@@ -156,7 +156,10 @@ local function query_entity(context, self, db, schema, method)
   local args
   if is_update or is_insert then
     args = self.args.post
-    resolve_foreign(self, db, schema, args)
+    local ok, err, err_t = resolve_foreign(self, db, schema, args)
+    if not ok then
+      return nil, err, err_t
+    end
   else
     args = self.args.uri
   end
@@ -246,22 +249,40 @@ resolve_foreign = function(self, db, schema, args)
     local foreign_schema = foreign_field.schema
     if foreign_field.type == "foreign" and not foreign_schema.legacy then
       local foreign_args = args[foreign_field_name]
-      if foreign_args then
+      if foreign_args and foreign_args ~= null then
         local foreign_pk = foreign_schema:extract_pk_values(foreign_args)
-        local foreign_param = foreign_args[foreign_schema.endpoint_key]
-        if not foreign_schema:validate_primary_key(foreign_pk) and
-          foreign_param then
-          local previous = self.params[foreign_schema.name]
-          self.params[foreign_schema.name] = foreign_param
-          local foreign_entity, _, err_t = select_entity(self, db, foreign_schema)
+
+        if not foreign_schema:validate_primary_key(foreign_pk) then
+          local foreign_param = foreign_args[foreign_schema.endpoint_key]
+          local foreign_entity, err, err_t
+          if foreign_param and foreign_param ~= null then
+            local previous = self.params[foreign_schema.name]
+            self.params[foreign_schema.name] = foreign_param
+            foreign_entity, err, err_t = select_entity(self, db, foreign_schema)
+            self.params[foreign_schema.name] = previous
+          end
+
+          if err_t then
+            return nil, err, err_t, foreign_field_name
+          end
+
+          if not foreign_entity then
+            local opts = extract_options(foreign_args, foreign_schema, "insert")
+            foreign_entity, err, err_t = db[foreign_schema.name]:insert(foreign_args, opts)
+            if err_t then
+              return nil, err, err_t, foreign_field_name
+            end
+          end
+
           if foreign_entity then
             args[foreign_field_name] = foreign_schema:extract_pk_values(foreign_entity)
           end
-          self.params[foreign_schema.name] = previous
         end
       end
     end
   end
+
+  return true
 end
 
 
