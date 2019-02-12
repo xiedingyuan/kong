@@ -792,7 +792,36 @@ function Schema:validate_field(field, value)
     end
 
   elseif field.type == "foreign" then
-    local ok, errs = field.schema:validate_primary_key(value, true)
+    local ok, errs
+    local foreign_pk = field.schema:extract_pk_values(value)
+    if next(foreign_pk) then
+      ok, errs = field.schema:validate_primary_key(value, true)
+
+    else
+      ok, errs = field.schema:validate(value, false)
+      if ok then
+        local found_unique
+        for k, v in pairs(value) do
+          if v ~= null then
+            if k == field.schema.endpoint_key then
+              found_unique = true
+              break
+            end
+
+            local f = field.schema.fields[k]
+            if f and f.unique then
+              found_unique = true
+              break
+            end
+          end
+        end
+
+        if not found_unique then
+          ok, errs = field.schema:validate_primary_key(value, true)
+        end
+      end
+    end
+
     if not ok then
       -- TODO check with GUI team if they need prefer information
       -- of failed components of a compound foreign key

@@ -239,6 +239,58 @@ local function propagate_cascade_delete_events(entries)
 end
 
 
+local function resolve_foreign_keys(self, entity)
+  local errors = {}
+
+  for foreign_field_name, foreign_field in self.schema:each_field() do
+    local foreign_schema = foreign_field.schema
+    if foreign_field.type == "foreign" and not foreign_schema.legacy then
+      local foreign_args = entity[foreign_field_name]
+      if foreign_args and foreign_args ~= null then
+        if not foreign_schema:validate_primary_key(foreign_args, true) then
+          local foreign_errors = {}
+
+          for unique_field_name, unique_field in foreign_schema:each_field() do
+            if unique_field.unique or unique_field.endpoint_key then
+              local unique_value = foreign_args[unique_field_name]
+              if unique_value and unique_value ~= null then
+                local dao = self.db[foreign_schema.name]
+                local foreign_entity, err, err_t = dao["select_by_" .. unique_field_name](dao, unique_value)
+                if err_t then
+                  return nil, err, err_t
+                end
+
+                if foreign_entity then
+                  entity[foreign_field_name] = foreign_schema:extract_pk_values(foreign_entity)
+                  break
+                end
+
+                foreign_errors[unique_field_name] = {
+                  name   = unique_field_name,
+                  value  = unique_value,
+                  parent = foreign_schema.name,
+                }
+              end
+            end
+          end
+
+          if next(foreign_errors) then
+            errors[foreign_field_name] = foreign_errors
+          end
+        end
+      end
+    end
+  end
+
+  if next(errors) then
+    local err_t = self.errors:foreign_keys_unresolved(errors)
+    return nil, tostring(err_t), err_t
+  end
+
+  return true
+end
+
+
 local function generate_foreign_key_methods(schema)
   local methods = {}
 
@@ -407,6 +459,11 @@ local function generate_foreign_key_methods(schema)
           return nil, err, err_t
         end
 
+        local ok, err, err_t = resolve_foreign_keys(self, entity_to_update)
+        if not ok then
+          return nil, err, err_t
+        end
+
         local row, err_t = self.strategy:update_by_field(name, unique_value,
                                                          entity_to_update, options)
         if not row then
@@ -461,6 +518,11 @@ local function generate_foreign_key_methods(schema)
             local err_t = self.errors:invalid_options(errors)
             return nil, tostring(err_t), err_t
           end
+        end
+
+        local ok, err, err_t = resolve_foreign_keys(self, entity_to_upsert)
+        if not ok then
+          return nil, err, err_t
         end
 
         local row, err_t = self.strategy:upsert_by_field(name, unique_value,
@@ -706,6 +768,11 @@ function DAO:insert(entity, options)
     entity_to_insert.cache_key = self:cache_key(entity_to_insert)
   end
 
+  local ok, err, err_t = resolve_foreign_keys(self, entity_to_insert)
+  if not ok then
+    return nil, err, err_t
+  end
+
   local row, err_t = self.strategy:insert(entity_to_insert, options)
   if not row then
     return nil, tostring(err_t), err_t
@@ -741,6 +808,11 @@ function DAO:update(primary_key, entity, options)
                                                                 entity,
                                                                 options)
   if not entity_to_update then
+    return nil, err, err_t
+  end
+
+  local ok, err, err_t = resolve_foreign_keys(self, entity_to_update)
+  if not ok then
     return nil, err, err_t
   end
 
@@ -796,6 +868,11 @@ function DAO:upsert(primary_key, entity, options)
 
   if self.schema.cache_key and #self.schema.cache_key > 1 then
     entity_to_upsert.cache_key = self:cache_key(entity_to_upsert)
+  end
+
+  local ok, err, err_t = resolve_foreign_keys(self, entity_to_upsert)
+  if not ok then
+    return nil, err, err_t
   end
 
   local row, err_t = self.strategy:upsert(primary_key, entity_to_upsert, options)
