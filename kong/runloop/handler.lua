@@ -15,6 +15,7 @@ local reports     = require "kong.reports"
 local balancer    = require "kong.runloop.balancer"
 local mesh        = require "kong.runloop.mesh"
 local constants   = require "kong.constants"
+local regex       = require "ngx.re"
 local semaphore   = require "ngx.semaphore"
 local singletons  = require "kong.singletons"
 local certificate = require "kong.runloop.certificate"
@@ -833,6 +834,59 @@ return {
       -- ngx.req.start_time() is kept in seconds with millisecond resolution.
       ctx.KONG_PROXY_LATENCY   = now - ngx.req.start_time() * 1000
       ctx.KONG_PROXIED         = true
+
+      -- clear hop-by-hop request headers:
+      local connection = var.http_connection
+      if connection then
+        local header_names = regex.split(connection .. ",", [[\s*,\s*]], "djo")
+        if header_names then
+          for i=1, #header_names do
+            if header_names[i] ~= "" then
+              local header_name = lower(header_names[i])
+              if header_name ~= "close" and header_name ~= "upgrade" then
+                ngx.req.clear_header(header_names[i])
+              end
+            end
+          end
+        end
+      end
+
+      -- TODO: what if plugins set these? If we remove early, what if plugins need these?
+      if var.http_keep_alive then
+        ngx.req.clear_header("Keep-Alive")
+      end
+
+      if var.http_proxy then
+        ngx.req.clear_header("Proxy")
+      end
+
+      if var.http_proxy_connection then
+        ngx.req.clear_header("Proxy-Connection")
+      end
+
+      if var.http_proxy_authenticate then
+        ngx.req.clear_header("Proxy-Authenticate")
+      end
+
+      if var.http_proxy_authorization then
+        ngx.req.clear_header("Proxy-Authorization")
+      end
+
+      if var.http_te then
+        ngx.req.clear_header("TE")
+      end
+
+      if var.http_transfer_encoding then
+        ngx.req.clear_header("Transfer-Encoding")
+      end
+
+      if var.http_trailer then
+        ngx.req.clear_header("Trailer")
+      end
+
+      if var.http_upgrade and not var.upstream_upgrade then
+        ngx.req.clear_header("Upgrade")
+      end
     end
   },
   balancer = {
@@ -865,6 +919,57 @@ return {
       -- time spent waiting for a response from upstream
       ctx.KONG_WAITING_TIME             = now - ctx.KONG_ACCESS_ENDED_AT
       ctx.KONG_HEADER_FILTER_STARTED_AT = now
+
+      -- clear hop-by-hop response headers:
+      local var = ngx.var
+
+      local connection = var.upstream_http_connection
+      if connection then
+        local header_names = regex.split(connection .. ",", [[\s*,\s*]], "djo")
+        if header_names then
+          for i=1, #header_names do
+            if header_names[i] ~= "" and lower(header_names[i]) ~= "close" then
+              header[header_names[i]] = nil
+            end
+          end
+        end
+      end
+
+      if var.upstream_http_keep_alive then
+        header["Keep-Alive"] = nil
+      end
+
+      if var.upstream_http_proxy then
+        header["Proxy"] = nil
+      end
+
+      if var.upstream_http_proxy_connection then
+        header["Proxy-Connection"] = nil
+      end
+
+      if var.upstream_http_proxy_authenticate then
+        header["Proxy-Authenticate"] = nil
+      end
+
+      if var.upstream_http_proxy_authorization then
+        header["Proxy-Authorization"] = nil
+      end
+
+      if var.upstream_http_te then
+        header["TE"] = nil
+      end
+
+      if var.upstream_http_transfer_encoding then
+        header["Transfer-Encoding"] = nil
+      end
+
+      if var.upstream_http_trailer then
+        header["Trailer"] = nil
+      end
+
+      if var.upstream_http_upgrade then
+        header["Upgrade"] = nil
+      end
 
       local upstream_status_header = constants.HEADERS.UPSTREAM_STATUS
       if singletons.configuration.enabled_headers[upstream_status_header] then

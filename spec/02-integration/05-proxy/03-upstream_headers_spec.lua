@@ -74,6 +74,75 @@ for _, strategy in helpers.each_strategy() do
       end
     end)
 
+    describe("hop-by-hop headers", function()
+      lazy_setup(start_kong {
+        database         = strategy,
+        nginx_conf       = "spec/fixtures/custom_nginx.template",
+        lua_package_path = "?/init.lua;./kong/?.lua;./spec/fixtures/?.lua",
+      })
+
+      lazy_teardown(stop_kong)
+
+      it("are removed from request", function()
+        local headers = request_headers({
+          ["Connection"]          = "X-Foo, X-Bar",
+          ["Host"]                = "headers-inspect.com",
+          ["Keep-Alive"]          = "timeout=5, max=1000",
+          ["Proxy"]               = "Remove-Me", -- See: https://httpoxy.org/
+          ["Proxy-Connection"]    = "close",
+          ["Proxy-Authenticate"]  = "Basic",
+          ["Proxy-Authorization"] = "Basic YWxhZGRpbjpvcGVuc2VzYW1l",
+          ["TE"]                  = "trailers, deflate;q=0.5",
+          ["Transfer-Encoding"]   = "identity",
+          ["Trailer"]             = "Expires",
+          ["Upgrade"]             = "example/1, foo/2",
+          ["X-Foo"]               = "Remove-Me",
+          ["X-Bar"]               = "Remove-Me",
+          ["X-Foo-Bar"]           = "Keep-Me",
+          ["Close"]               = "Keep-Me",
+        })
+
+        assert.is_nil(headers["keep-alive"])
+        assert.is_nil(headers["proxy"])
+        assert.is_nil(headers["proxy-connection"])
+        assert.is_nil(headers["proxy-authenticate"])
+        assert.is_nil(headers["proxy-authorization"])
+        assert.is_nil(headers["te"])
+        assert.is_nil(headers["trailer"])
+        assert.is_nil(headers["upgrade"])
+        assert.is_nil(headers["x-boo"])
+        assert.is_nil(headers["x-bar"])
+        assert.equal("Keep-Me", headers["x-foo-bar"])
+        assert.equal("Keep-Me", headers["close"])
+      end)
+
+      it("are removed from response", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          headers = {
+            ["Host"] = "headers-inspect.com",
+          },
+          path = "/hop-by-hop",
+        })
+
+        assert.res_status(200, res)
+
+        local headers = res.headers
+
+        assert.is_nil(headers["keep-alive"])
+        assert.is_nil(headers["proxy"])
+        assert.is_nil(headers["proxy-connection"])
+        assert.is_nil(headers["proxy-authenticate"])
+        assert.is_nil(headers["proxy-authorization"])
+        assert.is_nil(headers["te"])
+        assert.is_nil(headers["transfer-encoding"])
+        assert.is_nil(headers["trailer"])
+        assert.is_nil(headers["upgrade"])
+        assert.equal("Keep-Me", headers["x-foo-bar"])
+        assert.equal("Keep-Me", headers["close"])
+      end)
+    end)
+
     describe("(using the default configuration values)", function()
       lazy_setup(start_kong {
         database         = strategy,

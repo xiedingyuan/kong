@@ -362,6 +362,24 @@ http {
             }
         }
 
+        location = /hop-by-hop {
+            content_by_lua_block {
+                local header = ngx.header
+                header["Keep-Alive"]          = "timeout=5, max=1000"
+                header["Proxy"]               = "Remove-Me"
+                header["Proxy-Connection"]    = "close"
+                header["Proxy-Authenticate"]  = "Basic"
+                header["Proxy-Authorization"] = "Basic YWxhZGRpbjpvcGVuc2VzYW1l"
+                header["Transfer-Encoding"]   = "identity"
+                header["TE"]                  = "trailers, deflate;q=0.5"
+                header["Trailer"]             = "Expires"
+                header["Upgrade"]             = "example/1, foo/2"
+                header["X-Foo-Bar"]           = "Keep-Me"
+                header["Close"]               = "Keep-Me"
+                header["Content-Length"]      = "0"
+            }
+        }
+
         location ~ "^/basic-auth/(?<username>[a-zA-Z0-9_]+)/(?<password>.+)$" {
             access_by_lua_block {
                 local mu = require "spec.fixtures.mock_upstream"
